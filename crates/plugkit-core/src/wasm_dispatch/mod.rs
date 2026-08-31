@@ -2,7 +2,7 @@
 
 pub(crate) mod host_abi;
 mod events;
-mod verbs;
+pub(crate) mod verbs;
 
 pub use host_abi::{
     host_fs_read, host_fs_write, host_fs_readdir, host_fs_stat,

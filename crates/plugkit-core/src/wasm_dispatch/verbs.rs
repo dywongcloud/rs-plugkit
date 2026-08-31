@@ -871,6 +871,55 @@ pub fn memory_recall_backend(query_embedding: &Value, namespace: &str, limit: u3
         .filter(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(false))
 }
 
+/// Hybrid recall (Exa composite-merge pattern): when the vector leg matched,
+/// ALSO run the keyword (kv) leg and fuse both rankings with reciprocal-rank
+/// fusion instead of treating keyword as a fallback-only path. Ranked lists on
+/// different score scales must not be score-added; RRF over rank order is the
+/// robust merge (same machinery as `dataflow_exec`'s `rrf_fuse`). Returns None
+/// when there is nothing to fuse (either leg empty), so callers keep their
+/// existing single-leg behavior.
+pub fn hybrid_recall_fuse(namespace: &str, query: &str, vector_hits: &Value, cfg: &crate::ragconfig::RagConfig) -> Option<Vec<Value>> {
+    let vec_arr = vector_hits.as_array()?;
+    if vec_arr.is_empty() { return None; }
+    let packed = unsafe { host_kv_query(namespace.as_ptr(), namespace.len() as u32, query.as_ptr(), query.len() as u32) };
+    let kv = unpack_to_value(packed);
+    let kv_arr = kv.as_array()?;
+    if kv_arr.is_empty() { return None; }
+    let keys_of = |arr: &[Value]| -> Vec<String> {
+        arr.iter().filter_map(|h| h.get("key").and_then(|k| k.as_str()).map(String::from)).collect()
+    };
+    let vec_keys = keys_of(vec_arr);
+    let kv_keys = keys_of(kv_arr);
+    if vec_keys.is_empty() || kv_keys.is_empty() { return None; }
+    let fused = rs_search::fusion::fuse_n_cfg(
+        &[vec_keys, kv_keys],
+        &[cfg.scoring.fusion_vector_list_weight, cfg.scoring.fusion_identifier_boost],
+        query,
+        cfg.scoring.fusion_rrf_k,
+    );
+    if fused.is_empty() { return None; }
+    let mut by_key: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    for h in vec_arr.iter().cloned().chain(kv_arr.iter().cloned()) {
+        if let Some(k) = h.get("key").and_then(|k| k.as_str()) {
+            by_key.entry(k.to_string()).or_insert(h);
+        }
+    }
+    let hits: Vec<Value> = fused
+        .iter()
+        .filter_map(|(key, score)| {
+            by_key.get(key).map(|h| {
+                let mut h = h.clone();
+                if let Some(obj) = h.as_object_mut() {
+                    obj.insert("rrf_score".to_string(), json!(score));
+                }
+                h
+            })
+        })
+        .collect();
+    if hits.is_empty() { return None; }
+    Some(hits)
+}
+
 fn recall(body: &Value) -> u64 {
     let cfg = crate::ragconfig::RagConfig::resolved();
     let query = body.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -907,6 +956,15 @@ fn recall(body: &Value) -> u64 {
         let now_ms = unsafe { host_now_ms() } as i64;
         if let Ok(md_hits) = crate::rssearch_vectors::search_memory_hits_cfg(&embedding, mem_ns, limit as usize, now_ms, &cfg) {
             if md_hits.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                if let Some(fused) = hybrid_recall_fuse(namespace, query, &md_hits, &cfg) {
+                    return ok("recall", json!({
+                        "mode": "hybrid_rrf",
+                        "namespace": namespace,
+                        "derived_query": derived_query,
+                        "hits": fused,
+                        "vector_hits": vector_hits,
+                    }));
+                }
                 return ok("recall", json!({
                     "mode": "vector_top_k",
                     "namespace": namespace,
@@ -919,7 +977,16 @@ fn recall(body: &Value) -> u64 {
     }
     let vec_hits = vec_search_local(&embedding, namespace, limit);
     if !vec_hits.is_null() && vec_hits.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-        let annotated = annotate_hits_with_score(vec_hits);
+        let annotated = annotate_hits_with_score(vec_hits.clone());
+        if let Some(fused) = hybrid_recall_fuse(namespace, query, &annotated, &cfg) {
+            return ok("recall", json!({
+                "mode": "hybrid_rrf",
+                "namespace": namespace,
+                "derived_query": derived_query,
+                "hits": fused,
+                "vector_hits": vector_hits,
+            }));
+        }
         return ok("recall", json!({
             "mode": "vector_top_k",
             "namespace": namespace,

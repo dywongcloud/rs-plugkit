@@ -81,6 +81,13 @@ pub fn recall_hits_reporting_embed_failure(query_text: &str, limit: u32) -> (ser
             }));
         }
         if let Some(md_hits) = crate::wasm_dispatch::memory_recall_backend(&embedding, namespace, limit) {
+            let cfg = crate::ragconfig::RagConfig::resolved();
+            if let Some(fused) = crate::wasm_dispatch::verbs::hybrid_recall_fuse(namespace, &query, &md_hits, &cfg) {
+                let fused_v = serde_json::Value::Array(fused);
+                rlog("recall::recall_hits done via hybrid_rrf (md-index + kv)");
+                emit_recall(&query, &fused_v, "hybrid_rrf", namespace);
+                return (fused_v, embed_failed);
+            }
             rlog("recall::recall_hits done via md-index");
             emit_recall(&query, &md_hits, "vector_top_k", namespace);
             return (md_hits, embed_failed);
@@ -90,6 +97,13 @@ pub fn recall_hits_reporting_embed_failure(query_text: &str, limit: u32) -> (ser
         if !vec_hits.is_null()
             && vec_hits.as_array().map(|a| !a.is_empty()).unwrap_or(false)
         {
+            let cfg = crate::ragconfig::RagConfig::resolved();
+            if let Some(fused) = crate::wasm_dispatch::verbs::hybrid_recall_fuse(namespace, &query, &vec_hits, &cfg) {
+                let fused_v = serde_json::Value::Array(fused);
+                rlog("recall::recall_hits done via hybrid_rrf (vec + kv)");
+                emit_recall(&query, &fused_v, "hybrid_rrf", namespace);
+                return (fused_v, embed_failed);
+            }
             rlog("recall::recall_hits done via vec_search");
             emit_recall(&query, &vec_hits, "vector_top_k", namespace);
             return (vec_hits, embed_failed);
