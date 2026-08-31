@@ -762,9 +762,50 @@ pub fn sync_index(namespaces: &[String], now_ms: i64) -> Value {
         }));
     }
     let _ = now_ms;
+    // MANIFEST-last content-addressed commit (Exa artifact protocol): a fully
+    // converged pass seals the whole corpus state into one immutable manifest
+    // written only AFTER every namespace converged -- consumers can then gate on
+    // one content-addressed artifact instead of re-deriving convergence from
+    // per-namespace digests, and a later session can prove the index it reads
+    // corresponds to a sealed corpus state, not a half-applied pass.
+    if converged {
+        write_sync_manifest(namespaces, started);
+    }
     match crate::vecns::index_left_dirty_by_shadow_rows() {
         Some(index) => json!({ "converged": converged, "report": report, "vector_index_rebuilt": index }),
         None => json!({ "converged": converged, "report": report }),
+    }
+}
+
+/// Writes `.gm/memories/.sync-manifest.json` sealing a fully-converged pass.
+/// Identity is the fnv1a64 hash of the canonical (namespace, digest) set, so
+/// two passes over identical corpus state produce the identical manifest hash
+/// (content-addressed, replay-safe); `ts` records when the seal happened.
+fn write_sync_manifest(namespaces: &[String], started: u64) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for ns in namespaces {
+            if crate::ragconfig::NamespaceConfig::default().is_code(ns) {
+                continue;
+            }
+            if let Some(d) = meta_digest(ns) {
+                pairs.push((ns.clone(), d));
+            }
+        }
+        pairs.sort();
+        let canonical = serde_json::to_string(&pairs).unwrap_or_default();
+        let manifest_hash = format!("{:016x}", crate::hash::fnv1a64(canonical.as_bytes()));
+        let manifest = json!({
+            "kind": "memory-sync-manifest",
+            "schema_version": 1,
+            "digests": pairs.iter().map(|(ns, d)| json!({"namespace": ns, "digest": d})).collect::<Vec<_>>(),
+            "manifest_hash": manifest_hash,
+            "manifest_hash_algo": "fnv1a64",
+            "started_ms": started,
+            "sealed_ms": unsafe { crate::wasm_dispatch::host_now_ms() },
+        });
+        let _ = crate::wasm_dispatch::host_write(".gm/memories/.sync-manifest.json", &manifest.to_string());
     }
 }
 

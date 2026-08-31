@@ -205,6 +205,7 @@ pub fn set_phase_with_session_with_graph(phase: Phase, last_skill: Option<String
     let mut s = read_state_with_graph(g);
     let from = s.phase.as_str().to_string();
     let to = phase.as_str().to_string();
+    let is_terminal = to == g.policy.terminal_phase;
     if from != to {
         s.phase_history.push(PhaseTransitionEntry { from, to, ts_ms: now_ms() });
     }
@@ -217,7 +218,59 @@ pub fn set_phase_with_session_with_graph(phase: Phase, last_skill: Option<String
     }
     s.updated_at_ms = now_ms();
     write_state(&s)?;
+    // Canon VQL-trace pattern: reaching the graph's terminal phase seals a
+    // graph-shaped session trace (phase history + dispatch ledger + evidence
+    // receipt) into .gm/traces/ so a completed walk is replayable/inspectable
+    // as one document rather than reconstructed from scattered spool files.
+    if is_terminal {
+        write_session_trace(&s, g);
+    }
     Ok(s)
+}
+
+/// Persists `.gm/traces/trace-<ts>-<head8>.json` at walk completion: the
+/// session's phase history, the dispatch ledger verbatim, and the hash of the
+/// evidence receipt, keyed by content so two identical walks produce the same
+/// trace hash. Best-effort by design -- a trace-write failure never blocks a
+/// terminal transition.
+fn write_session_trace(s: &TurnState, g: &super::fsm::Graph) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let receipt = crate::evidence_receipt::write();
+        let ledger_raw = crate::wasm_dispatch::host_read(".gm/exec-spool/.dispatch-ledger.json").unwrap_or_default();
+        let ledger: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&ledger_raw)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let head8: String = receipt
+            .get("head_sha")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .chars()
+            .take(8)
+            .collect();
+        let canonical = serde_json::json!({
+            "phase_history": s.phase_history,
+            "head_sha": receipt.get("head_sha"),
+            "session_id": s.session_id,
+        });
+        let trace_hash = format!("{:016x}", crate::hash::fnv1a64(canonical.to_string().as_bytes()));
+        let ts = now_ms();
+        let trace = serde_json::json!({
+            "kind": "gm-session-trace",
+            "schema_version": 1,
+            "trace_hash": trace_hash,
+            "trace_hash_algo": "fnv1a64",
+            "terminal_phase": g.policy.terminal_phase,
+            "session_id": s.session_id,
+            "phase_history": s.phase_history,
+            "dispatch_ledger": ledger,
+            "evidence_receipt": receipt,
+            "sealed_ms": ts,
+        });
+        let path = format!(".gm/traces/trace-{}-{}.json", ts, head8);
+        let _ = crate::wasm_dispatch::host_write(&path, &trace.to_string());
+    }
 }
 
 /// Reverts the most recent recorded transition, restoring the phase it
